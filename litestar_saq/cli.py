@@ -25,7 +25,7 @@ SHUTDOWN_BUFFER = 2.0
 def get_max_shutdown_timeout(workers: "Collection[Worker]") -> float:
     """Calculate the maximum shutdown timeout from worker configurations.
 
-    The timeout is the maximum of all workers' shutdown_grace_period_s plus
+    The timeout is the maximum of all workers' shutdown_grace_period_s + cancellation_hard_deadline_s plus
     a buffer for signal propagation. Falls back to DEFAULT_SHUTDOWN_TIMEOUT
     if no grace periods are configured.
 
@@ -37,11 +37,13 @@ def get_max_shutdown_timeout(workers: "Collection[Worker]") -> float:
     """
     grace_periods: list[float] = []
     for worker in workers:
-        grace_period = getattr(worker, "_shutdown_grace_period_s", None)
-        if grace_period is not None:
-            grace_periods.append(grace_period)
+        shutdown_grace_period = getattr(worker, "_shutdown_grace_period_s", 0)
+        cancellation_hard_deadline = getattr(worker, "_cancellation_hard_deadline_s", 0)
+        grace_period = shutdown_grace_period + cancellation_hard_deadline
+        grace_periods.append(grace_period)
     if grace_periods:
-        return max(grace_periods) + SHUTDOWN_BUFFER
+        # This ensures that the overall shutdown timeout is always at least 5s
+        return max(max(grace_periods) + SHUTDOWN_BUFFER, DEFAULT_SHUTDOWN_TIMEOUT)
     return DEFAULT_SHUTDOWN_TIMEOUT
 
 
