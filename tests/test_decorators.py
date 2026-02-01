@@ -245,19 +245,22 @@ async def test_monitored_job_handles_none_job() -> None:
     assert result == "completed"
 
 
-async def test_monitored_job_logs_missing_job(caplog: pytest.LogCaptureFixture) -> None:
-    """Test DEBUG log when job is missing from context."""
+async def test_monitored_job_handles_missing_job_silently() -> None:
+    """Test job runs without logging when job is missing from context.
+
+    When no job is in context, heartbeat monitoring is silently skipped.
+    The job function still executes normally without any errors or logs.
+    """
     ctx = cast(Context, {})
 
     @monitored_job(interval=0.01)
     async def task(ctx: Context) -> str:
-        await asyncio.sleep(0.02)  # Give time for heartbeat loop to start
+        await asyncio.sleep(0.02)
         return "done"
 
-    with caplog.at_level(logging.DEBUG, logger="litestar_saq.decorators"):
-        await task(ctx)
-
-    assert "No job in context, heartbeat monitoring disabled" in caplog.text
+    # Should complete without error
+    result = await task(ctx)
+    assert result == "done"
 
 
 # =============================================================================
@@ -691,3 +694,127 @@ async def test_monitored_job_auto_interval_from_heartbeat() -> None:
 
     result = await task(ctx)
     assert result == "done"
+
+
+# =============================================================================
+# HeartbeatManager Integration Tests
+# =============================================================================
+
+
+async def test_monitored_job_uses_manager_when_available() -> None:
+    """Test decorator uses HeartbeatManager when present in context."""
+    job_mock = AsyncMock()
+    job_mock.id = "job-manager"
+    job_mock.update = AsyncMock()
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
+
+    @monitored_job(interval=0.02)
+    async def task(ctx: Context) -> str:
+        await asyncio.sleep(0.05)
+        return "done"
+
+    result = await task(ctx)
+
+    assert result == "done"
+    # Manager should have been used
+    manager_mock.register_job.assert_called_once_with(job_mock)
+    manager_mock.unregister_job.assert_called_once_with("job-manager")
+    # Signal should have been called at least once
+    assert manager_mock.signal.call_count >= 1
+
+
+async def test_monitored_job_signals_manager_periodically() -> None:
+    """Test decorator signals manager at configured interval."""
+    job_mock = AsyncMock()
+    job_mock.id = "job-signal"
+    job_mock.update = AsyncMock()
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
+
+    @monitored_job(interval=0.02)  # 20ms interval
+    async def task(ctx: Context) -> str:
+        await asyncio.sleep(0.1)  # 100ms runtime
+        return "done"
+
+    await task(ctx)
+
+    # Should have signaled multiple times (approximately 100/20 = 5 times)
+    assert manager_mock.signal.call_count >= 3
+
+
+async def test_monitored_job_unregisters_on_exception() -> None:
+    """Test decorator unregisters job even when exception occurs."""
+    job_mock = AsyncMock()
+    job_mock.id = "job-exception"
+    job_mock.update = AsyncMock()
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
+
+    @monitored_job(interval=0.01)
+    async def task(ctx: Context) -> None:
+        await asyncio.sleep(0.02)
+        msg = "Task failed"
+        raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match="Task failed"):
+        await task(ctx)
+
+    # unregister should still be called
+    manager_mock.unregister_job.assert_called_once_with("job-exception")
+
+
+async def test_monitored_job_falls_back_without_manager() -> None:
+    """Test decorator falls back to legacy behavior without manager."""
+    job_mock = AsyncMock()
+    job_mock.id = "job-legacy"
+    job_mock.update = AsyncMock()
+
+    # No heartbeat_manager in context
+    ctx = cast(Context, {"job": job_mock})
+
+    @monitored_job(interval=0.02)
+    async def task(ctx: Context) -> str:
+        await asyncio.sleep(0.05)
+        return "done"
+
+    result = await task(ctx)
+
+    assert result == "done"
+    # Should have called job.update directly (legacy behavior)
+    assert job_mock.update.call_count >= 1
+
+
+async def test_monitored_job_manager_not_called_when_no_job() -> None:
+    """Test decorator doesn't use manager when no job in context."""
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"heartbeat_manager": manager_mock})
+
+    @monitored_job(interval=0.01)
+    async def task(ctx: Context) -> str:
+        return "done"
+
+    result = await task(ctx)
+
+    assert result == "done"
+    # Manager should not have been called (no job to register)
+    manager_mock.register_job.assert_not_called()
+    manager_mock.signal.assert_not_called()
