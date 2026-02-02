@@ -1,5 +1,6 @@
 """Tests for HeartbeatManager."""
 
+import asyncio
 import threading
 import time
 from unittest.mock import AsyncMock, Mock
@@ -491,7 +492,7 @@ async def test_worker_stops_heartbeat_manager_on_shutdown() -> None:
 
     assert worker._heartbeat_manager is None
     # Thread should have stopped
-    time.sleep(0.1)  # Allow thread cleanup
+    await asyncio.sleep(0.1)  # Allow thread cleanup
     assert not manager._thread.is_alive()
 
 

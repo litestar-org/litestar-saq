@@ -231,12 +231,12 @@ class HeartbeatManager:
         try:
             from saq.queue.postgres import PostgresQueue
         except ImportError:
-            PostgresQueue = None  # type: ignore[misc,assignment]
+            PostgresQueue = None  # type: ignore[misc,assignment]  # noqa: N806
 
         try:
             from saq.queue.redis import RedisQueue
         except ImportError:
-            RedisQueue = None  # type: ignore[misc,assignment]
+            RedisQueue = None  # type: ignore[misc,assignment]  # noqa: N806
 
         # Dispatch to backend-specific implementation
         if RedisQueue is not None and isinstance(self._queue, RedisQueue):
@@ -269,7 +269,7 @@ class HeartbeatManager:
             # Notify subscribers (required for SAQ's job tracking)
             for job in jobs:
                 try:
-                    await queue.notify(job)  # type: ignore[attr-defined]
+                    await queue.notify(job)
                 except Exception:  # noqa: BLE001
                     # Notification failure shouldn't fail the heartbeat
                     logger.debug("Failed to notify for job %s", job.id)
