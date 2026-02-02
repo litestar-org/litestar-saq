@@ -16,6 +16,8 @@ from collections.abc import Mapping
 from importlib.util import find_spec
 from typing import Any, Optional
 
+from typing_extensions import Self
+
 __all__ = (
     "OPENTELEMETRY_INSTALLED",
     "STRUCTLOG_INSTALLED",
@@ -90,7 +92,7 @@ class SpanStub:
         """
         return False
 
-    def __enter__(self) -> "SpanStub":
+    def __enter__(self) -> Self:
         """Context manager entry.
 
         Returns:
