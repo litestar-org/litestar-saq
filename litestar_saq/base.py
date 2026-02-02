@@ -98,7 +98,7 @@ class Worker(SaqWorker[Context]):
         otel_tracer: Optional custom tracer instance. If not provided and enable_otel
             is True, a default tracer will be created.
         enable_heartbeat_manager: Enable centralized HeartbeatManager for batched
-            heartbeat updates. When enabled, the manager is injected into job context
+            heartbeat updates (default: True). The manager is injected into job context
             and used by the @monitored_job decorator for efficient batched updates.
         heartbeat_flush_interval: Seconds between heartbeat batch flushes when
             HeartbeatManager is enabled. Default: 30.0.
@@ -129,7 +129,7 @@ class Worker(SaqWorker[Context]):
         poll_interval: "Optional[float]" = None,
         enable_otel: bool = False,
         otel_tracer: "Optional[Tracer]" = None,
-        enable_heartbeat_manager: bool = False,
+        enable_heartbeat_manager: bool = True,
         heartbeat_flush_interval: float = 30.0,
     ) -> None:
         self.separate_process = separate_process

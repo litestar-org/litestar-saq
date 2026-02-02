@@ -63,10 +63,7 @@ def test_signal_is_thread_safe() -> None:
         for _ in range(100):
             manager.signal(job_id)
 
-    threads = [
-        threading.Thread(target=signal_from_thread, args=(f"job-{i}",))
-        for i in range(10)
-    ]
+    threads = [threading.Thread(target=signal_from_thread, args=(f"job-{i}",)) for i in range(10)]
     for t in threads:
         t.start()
     for t in threads:
@@ -403,8 +400,8 @@ def test_worker_creates_heartbeat_manager_when_enabled() -> None:
     assert worker._heartbeat_manager is None
 
 
-def test_worker_does_not_create_manager_when_disabled() -> None:
-    """Test Worker doesn't create HeartbeatManager when disabled (default)."""
+def test_worker_creates_manager_by_default() -> None:
+    """Test Worker creates HeartbeatManager by default (enabled=True)."""
     from litestar_saq.base import Worker
 
     queue_mock = Mock()
@@ -415,6 +412,27 @@ def test_worker_does_not_create_manager_when_disabled() -> None:
     worker = Worker(
         queue=queue_mock,
         functions=[dummy_task],
+    )
+
+    # Default is now True
+    assert worker._enable_heartbeat_manager is True
+    # Manager is created lazily in on_app_startup, so it's None initially
+    assert worker._heartbeat_manager is None
+
+
+def test_worker_does_not_create_manager_when_explicitly_disabled() -> None:
+    """Test Worker doesn't create HeartbeatManager when explicitly disabled."""
+    from litestar_saq.base import Worker
+
+    queue_mock = Mock()
+
+    async def dummy_task(ctx: dict) -> None:
+        pass
+
+    worker = Worker(
+        queue=queue_mock,
+        functions=[dummy_task],
+        enable_heartbeat_manager=False,
     )
 
     assert worker._enable_heartbeat_manager is False

@@ -95,16 +95,21 @@ def test_monitored_job_default_interval() -> None:
 
 
 # =============================================================================
-# Heartbeat Sending Tests
+# Heartbeat Signaling Tests (via HeartbeatManager)
 # =============================================================================
 
 
-async def test_monitored_job_sends_heartbeats() -> None:
-    """Test heartbeats are sent at the configured interval."""
+async def test_monitored_job_signals_manager() -> None:
+    """Test heartbeats are signaled to manager at the configured interval."""
     job_mock = AsyncMock()
     job_mock.id = "job-123"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.05)  # 50ms interval
     async def slow_task(ctx: Context) -> str:
@@ -114,31 +119,36 @@ async def test_monitored_job_sends_heartbeats() -> None:
     result = await slow_task(ctx)
 
     assert result == "done"
-    # Should have sent at least 2 heartbeats (at 50ms and 100ms)
-    assert job_mock.update.call_count >= 2
+    # Should have signaled at least 2 times (at 50ms and 100ms)
+    assert manager_mock.signal.call_count >= 2
 
 
-async def test_monitored_job_first_heartbeat_after_interval() -> None:
-    """Test first heartbeat is sent after first interval, not immediately."""
+async def test_monitored_job_first_signal_after_interval() -> None:
+    """Test first signal is sent after first interval, not immediately."""
     job_mock = AsyncMock()
     job_mock.id = "job-123"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
 
-    heartbeat_sent = False
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    signal_sent = False
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.1)  # 100ms interval
     async def quick_task(ctx: Context) -> str:
-        nonlocal heartbeat_sent
-        # This check happens immediately, before first heartbeat
-        heartbeat_sent = job_mock.update.called
+        nonlocal signal_sent
+        # This check happens immediately, before first signal
+        signal_sent = manager_mock.signal.called
         return "done"
 
     await quick_task(ctx)
 
-    # No heartbeat should have been sent during the task because it completed
+    # No signal should have been sent during the task because it completed
     # before the first interval elapsed
-    assert not heartbeat_sent
+    assert not signal_sent
 
 
 # =============================================================================
@@ -146,12 +156,17 @@ async def test_monitored_job_first_heartbeat_after_interval() -> None:
 # =============================================================================
 
 
-async def test_monitored_job_stops_on_completion() -> None:
-    """Test heartbeat task is cancelled when job completes successfully."""
+async def test_monitored_job_unregisters_on_completion() -> None:
+    """Test job is unregistered when job completes successfully."""
     job_mock = AsyncMock()
     job_mock.id = "job-123"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def task(ctx: Context) -> str:
@@ -161,21 +176,21 @@ async def test_monitored_job_stops_on_completion() -> None:
     result = await task(ctx)
 
     assert result == "success"
-    # After task completes, heartbeat should stop - give it a moment
-    await asyncio.sleep(0.05)
-    call_count_after = job_mock.update.call_count
-
-    # Wait a bit more to ensure no more heartbeats are sent
-    await asyncio.sleep(0.05)
-    assert job_mock.update.call_count == call_count_after
+    manager_mock.register_job.assert_called_once_with(job_mock)
+    manager_mock.unregister_job.assert_called_once_with("job-123")
 
 
-async def test_monitored_job_stops_on_exception() -> None:
-    """Test heartbeat task is cancelled when job raises exception."""
+async def test_monitored_job_unregisters_on_exception() -> None:
+    """Test job is unregistered when job raises exception."""
     job_mock = AsyncMock()
     job_mock.id = "job-456"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def failing_task(ctx: Context) -> None:
@@ -186,21 +201,21 @@ async def test_monitored_job_stops_on_exception() -> None:
     with pytest.raises(RuntimeError, match="Task failed"):
         await failing_task(ctx)
 
-    # After exception, heartbeat should stop
-    await asyncio.sleep(0.05)
-    call_count_after = job_mock.update.call_count
-
-    # Wait a bit more to ensure no more heartbeats are sent
-    await asyncio.sleep(0.05)
-    assert job_mock.update.call_count == call_count_after
+    # Should still have unregistered
+    manager_mock.unregister_job.assert_called_once_with("job-456")
 
 
 async def test_monitored_job_stops_on_cancellation() -> None:
-    """Test heartbeat task is cancelled when job is cancelled externally."""
+    """Test signal task is cancelled when job is cancelled externally."""
     job_mock = AsyncMock()
     job_mock.id = "job-789"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def long_task(ctx: Context) -> None:
@@ -215,7 +230,7 @@ async def test_monitored_job_stops_on_cancellation() -> None:
 
 
 # =============================================================================
-# Missing Job Context Tests
+# Missing Job/Manager Context Tests
 # =============================================================================
 
 
@@ -263,36 +278,34 @@ async def test_monitored_job_handles_missing_job_silently() -> None:
     assert result == "done"
 
 
-# =============================================================================
-# Error Handling Tests
-# =============================================================================
-
-
-async def test_monitored_job_continues_on_heartbeat_error() -> None:
-    """Test job continues when job.update() fails."""
+async def test_monitored_job_warns_without_manager(caplog: pytest.LogCaptureFixture) -> None:
+    """Test warning logged when no HeartbeatManager in context."""
     job_mock = AsyncMock()
-    job_mock.id = "job-error"
-    job_mock.update = AsyncMock(side_effect=RuntimeError("Connection lost"))
+    job_mock.id = "job-no-manager"
+
+    # No heartbeat_manager in context
     ctx = cast(Context, {"job": job_mock})
 
     @monitored_job(interval=0.02)
     async def task(ctx: Context) -> str:
-        await asyncio.sleep(0.1)  # Long enough for multiple heartbeat attempts
-        return "success"
+        await asyncio.sleep(0.01)
+        return "done"
 
-    result = await task(ctx)
+    with caplog.at_level(logging.WARNING, logger="litestar_saq.decorators"):
+        result = await task(ctx)
 
-    # Job should complete successfully despite heartbeat failures
-    assert result == "success"
-    # Heartbeats should have been attempted
-    assert job_mock.update.call_count >= 2
+    assert result == "done"
+    assert "No HeartbeatManager in context" in caplog.text
+    assert "job-no-manager" in caplog.text
 
 
-async def test_monitored_job_logs_heartbeat_error(caplog: pytest.LogCaptureFixture) -> None:
-    """Test heartbeat failures are logged as warnings."""
+async def test_monitored_job_runs_without_heartbeat_when_no_manager() -> None:
+    """Test job runs without heartbeats when no manager present."""
     job_mock = AsyncMock()
-    job_mock.id = "job-warning"
-    job_mock.update = AsyncMock(side_effect=RuntimeError("Network error"))
+    job_mock.id = "job-legacy"
+    job_mock.update = AsyncMock()
+
+    # No heartbeat_manager in context
     ctx = cast(Context, {"job": job_mock})
 
     @monitored_job(interval=0.02)
@@ -300,40 +313,11 @@ async def test_monitored_job_logs_heartbeat_error(caplog: pytest.LogCaptureFixtu
         await asyncio.sleep(0.05)
         return "done"
 
-    with caplog.at_level(logging.WARNING, logger="litestar_saq.decorators"):
-        await task(ctx)
-
-    assert "Failed to send heartbeat" in caplog.text
-    assert "job-warning" in caplog.text
-
-
-async def test_monitored_job_continues_after_multiple_failures() -> None:
-    """Test heartbeat loop continues after multiple consecutive failures."""
-    call_count = 0
-
-    async def failing_then_succeeding_update() -> None:
-        nonlocal call_count
-        call_count += 1
-        if call_count <= 2:
-            msg = f"Failure {call_count}"
-            raise RuntimeError(msg)
-        # Succeed on third call
-
-    job_mock = AsyncMock()
-    job_mock.id = "job-retry"
-    job_mock.update = AsyncMock(side_effect=failing_then_succeeding_update)
-    ctx = cast(Context, {"job": job_mock})
-
-    @monitored_job(interval=0.02)
-    async def task(ctx: Context) -> str:
-        await asyncio.sleep(0.1)  # Long enough for multiple heartbeat attempts
-        return "success"
-
     result = await task(ctx)
 
-    assert result == "success"
-    # At least 3 attempts should have been made
-    assert call_count >= 3
+    assert result == "done"
+    # job.update should NOT have been called (no legacy fallback)
+    assert job_mock.update.call_count == 0
 
 
 # =============================================================================
@@ -345,8 +329,13 @@ async def test_monitored_job_preserves_return_value() -> None:
     """Test job return value is preserved."""
     job_mock = AsyncMock()
     job_mock.id = "job-return"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def task(ctx: Context) -> dict[str, Any]:
@@ -361,8 +350,13 @@ async def test_monitored_job_preserves_exception() -> None:
     """Test job exception is propagated correctly."""
     job_mock = AsyncMock()
     job_mock.id = "job-exception"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     class CustomError(Exception):
         pass
@@ -384,8 +378,13 @@ async def test_monitored_job_custom_short_interval() -> None:
     """Test short custom interval."""
     job_mock = AsyncMock()
     job_mock.id = "job-short"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)  # 10ms interval
     async def task(ctx: Context) -> str:
@@ -394,16 +393,21 @@ async def test_monitored_job_custom_short_interval() -> None:
 
     await task(ctx)
 
-    # Should have sent ~4 heartbeats
-    assert job_mock.update.call_count >= 3
+    # Should have signaled ~4 times
+    assert manager_mock.signal.call_count >= 3
 
 
 async def test_monitored_job_custom_long_interval() -> None:
-    """Test long interval doesn't send heartbeat for short tasks."""
+    """Test long interval doesn't send signal for short tasks."""
     job_mock = AsyncMock()
     job_mock.id = "job-long-interval"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=1.0)  # 1 second interval
     async def task(ctx: Context) -> str:
@@ -412,8 +416,8 @@ async def test_monitored_job_custom_long_interval() -> None:
 
     await task(ctx)
 
-    # No heartbeats should have been sent (task shorter than interval)
-    assert job_mock.update.call_count == 0
+    # No signals should have been sent (task shorter than interval)
+    assert manager_mock.signal.call_count == 0
 
 
 # =============================================================================
@@ -423,10 +427,15 @@ async def test_monitored_job_custom_long_interval() -> None:
 
 async def test_monitored_job_concurrent_execution() -> None:
     """Test multiple decorated jobs don't interfere with each other."""
+    managers = [
+        Mock(register_job=Mock(), unregister_job=Mock(), signal=Mock()),
+        Mock(register_job=Mock(), unregister_job=Mock(), signal=Mock()),
+        Mock(register_job=Mock(), unregister_job=Mock(), signal=Mock()),
+    ]
     job_mocks = [
-        AsyncMock(id="job-1", update=AsyncMock()),
-        AsyncMock(id="job-2", update=AsyncMock()),
-        AsyncMock(id="job-3", update=AsyncMock()),
+        AsyncMock(id="job-1"),
+        AsyncMock(id="job-2"),
+        AsyncMock(id="job-3"),
     ]
 
     results: list[str] = []
@@ -439,17 +448,17 @@ async def test_monitored_job_concurrent_execution() -> None:
 
     # Run tasks concurrently
     await asyncio.gather(
-        task(cast(Context, {"job": job_mocks[0]}), task_id="task-1"),
-        task(cast(Context, {"job": job_mocks[1]}), task_id="task-2"),
-        task(cast(Context, {"job": job_mocks[2]}), task_id="task-3"),
+        task(cast(Context, {"job": job_mocks[0], "heartbeat_manager": managers[0]}), task_id="task-1"),
+        task(cast(Context, {"job": job_mocks[1], "heartbeat_manager": managers[1]}), task_id="task-2"),
+        task(cast(Context, {"job": job_mocks[2], "heartbeat_manager": managers[2]}), task_id="task-3"),
     )
 
     assert len(results) == 3
     assert set(results) == {"task-1", "task-2", "task-3"}
 
-    # Each job should have received heartbeats
-    for mock in job_mocks:
-        assert mock.update.call_count >= 1
+    # Each manager should have received signals
+    for manager in managers:
+        assert manager.signal.call_count >= 1
 
 
 # =============================================================================
@@ -457,30 +466,40 @@ async def test_monitored_job_concurrent_execution() -> None:
 # =============================================================================
 
 
-async def test_monitored_job_logs_heartbeat_sent(caplog: pytest.LogCaptureFixture) -> None:
-    """Test successful heartbeats are logged at DEBUG level."""
+async def test_monitored_job_logs_registration(caplog: pytest.LogCaptureFixture) -> None:
+    """Test job registration is logged at DEBUG level."""
     job_mock = AsyncMock()
-    job_mock.id = "job-log-success"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+    job_mock.id = "job-log-register"
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.02)
     async def task(ctx: Context) -> str:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.01)
         return "done"
 
     with caplog.at_level(logging.DEBUG, logger="litestar_saq.decorators"):
         await task(ctx)
 
-    assert "Heartbeat sent for job job-log-success" in caplog.text
+    assert "job-log-register registered with HeartbeatManager" in caplog.text
 
 
-async def test_monitored_job_logs_monitoring_stopped(caplog: pytest.LogCaptureFixture) -> None:
-    """Test monitoring stop is logged at DEBUG level."""
+async def test_monitored_job_logs_unregistration(caplog: pytest.LogCaptureFixture) -> None:
+    """Test job unregistration is logged at DEBUG level."""
     job_mock = AsyncMock()
-    job_mock.id = "job-log-stop"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+    job_mock.id = "job-log-unregister"
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def task(ctx: Context) -> str:
@@ -490,7 +509,7 @@ async def test_monitored_job_logs_monitoring_stopped(caplog: pytest.LogCaptureFi
     with caplog.at_level(logging.DEBUG, logger="litestar_saq.decorators"):
         await task(ctx)
 
-    assert "Heartbeat monitoring stopped for job job-log-stop" in caplog.text
+    assert "job-log-unregister unregistered from HeartbeatManager" in caplog.text
 
 
 # =============================================================================
@@ -523,8 +542,13 @@ async def test_monitored_job_with_kwargs() -> None:
     """Test decorator works with keyword arguments."""
     job_mock = AsyncMock()
     job_mock.id = "job-kwargs"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def task(ctx: Context, name: str, count: int = 1) -> dict[str, Any]:
@@ -558,12 +582,17 @@ async def test_monitored_job_with_queue_config_tasks() -> None:
 
 
 async def test_monitored_job_job_attribute_access() -> None:
-    """Test heartbeat loop handles job without id attribute."""
+    """Test signal loop handles job without id attribute."""
     job_mock = Mock()  # Regular Mock, not AsyncMock
-    job_mock.update = AsyncMock()
     # Don't set id attribute
     del job_mock.id
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.02)
     async def task(ctx: Context) -> str:
@@ -580,8 +609,13 @@ async def test_monitored_job_with_positional_args() -> None:
     """Test decorator works with positional arguments."""
     job_mock = AsyncMock()
     job_mock.id = "job-args"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def task(ctx: Context, name: str, count: int) -> dict[str, Any]:
@@ -597,8 +631,13 @@ async def test_monitored_job_with_mixed_args_kwargs() -> None:
     """Test decorator works with mixed positional and keyword arguments."""
     job_mock = AsyncMock()
     job_mock.id = "job-mixed"
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job(interval=0.01)
     async def task(ctx: Context, name: str, count: int, flag: bool = False) -> dict[str, Any]:
@@ -683,8 +722,13 @@ async def test_monitored_job_auto_interval_from_heartbeat() -> None:
     job_mock = AsyncMock()
     job_mock.id = "job-auto"
     job_mock.heartbeat = 60  # Should result in 30 second interval
-    job_mock.update = AsyncMock()
-    ctx = cast(Context, {"job": job_mock})
+
+    manager_mock = Mock()
+    manager_mock.register_job = Mock()
+    manager_mock.unregister_job = Mock()
+    manager_mock.signal = Mock()
+
+    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
 
     @monitored_job()  # No explicit interval
     async def task(ctx: Context) -> str:
@@ -705,7 +749,6 @@ async def test_monitored_job_uses_manager_when_available() -> None:
     """Test decorator uses HeartbeatManager when present in context."""
     job_mock = AsyncMock()
     job_mock.id = "job-manager"
-    job_mock.update = AsyncMock()
 
     manager_mock = Mock()
     manager_mock.register_job = Mock()
@@ -733,7 +776,6 @@ async def test_monitored_job_signals_manager_periodically() -> None:
     """Test decorator signals manager at configured interval."""
     job_mock = AsyncMock()
     job_mock.id = "job-signal"
-    job_mock.update = AsyncMock()
 
     manager_mock = Mock()
     manager_mock.register_job = Mock()
@@ -751,53 +793,6 @@ async def test_monitored_job_signals_manager_periodically() -> None:
 
     # Should have signaled multiple times (approximately 100/20 = 5 times)
     assert manager_mock.signal.call_count >= 3
-
-
-async def test_monitored_job_unregisters_on_exception() -> None:
-    """Test decorator unregisters job even when exception occurs."""
-    job_mock = AsyncMock()
-    job_mock.id = "job-exception"
-    job_mock.update = AsyncMock()
-
-    manager_mock = Mock()
-    manager_mock.register_job = Mock()
-    manager_mock.unregister_job = Mock()
-    manager_mock.signal = Mock()
-
-    ctx = cast(Context, {"job": job_mock, "heartbeat_manager": manager_mock})
-
-    @monitored_job(interval=0.01)
-    async def task(ctx: Context) -> None:
-        await asyncio.sleep(0.02)
-        msg = "Task failed"
-        raise RuntimeError(msg)
-
-    with pytest.raises(RuntimeError, match="Task failed"):
-        await task(ctx)
-
-    # unregister should still be called
-    manager_mock.unregister_job.assert_called_once_with("job-exception")
-
-
-async def test_monitored_job_falls_back_without_manager() -> None:
-    """Test decorator falls back to legacy behavior without manager."""
-    job_mock = AsyncMock()
-    job_mock.id = "job-legacy"
-    job_mock.update = AsyncMock()
-
-    # No heartbeat_manager in context
-    ctx = cast(Context, {"job": job_mock})
-
-    @monitored_job(interval=0.02)
-    async def task(ctx: Context) -> str:
-        await asyncio.sleep(0.05)
-        return "done"
-
-    result = await task(ctx)
-
-    assert result == "done"
-    # Should have called job.update directly (legacy behavior)
-    assert job_mock.update.call_count >= 1
 
 
 async def test_monitored_job_manager_not_called_when_no_job() -> None:

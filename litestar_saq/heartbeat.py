@@ -93,7 +93,7 @@ class HeartbeatManager:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._jobs: dict[str, "Job"] = {}  # job_id -> Job reference
+        self._jobs: dict[str, Job] = {}  # job_id -> Job reference
         self._jobs_lock = threading.Lock()
 
     def start(self) -> None:
