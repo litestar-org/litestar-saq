@@ -25,7 +25,7 @@ license = { text = "MIT" }
 name = "litestar-saq"
 readme = "README.md"
 requires-python = ">=3.9"
-version = "0.6.4"
+version = "0.7.0"
 
 [project.optional-dependencies]
 hiredis = ["hiredis"]
@@ -81,7 +81,7 @@ test = [
 allow_dirty = true
 commit = false
 commit_args = "--no-verify"
-current_version = "0.6.4"
+current_version = "0.7.0"
 ignore_missing_files = false
 ignore_missing_version = false
 message = "chore(release): bump to `v{new_version}`"
