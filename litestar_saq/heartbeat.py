@@ -1,3 +1,5 @@
+# pyright: reportUnknownMemberType=false
+# ruff: noqa: BLE001
 """Heartbeat manager for batched job heartbeat updates.
 
 This module provides a centralized heartbeat manager that batches and
@@ -22,8 +24,10 @@ Usage:
 """
 
 import asyncio
+import contextlib
 import logging
 import threading
+import time
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -36,9 +40,6 @@ logger = logging.getLogger(__name__)
 
 
 def _now() -> int:
-    """Get current time in milliseconds (matches SAQ's now() function)."""
-    import time
-
     return int(time.time() * 1000)
 
 
@@ -124,6 +125,10 @@ class HeartbeatManager:
         to terminate. After stopping, pending heartbeats are lost.
         """
         self._stop_event.set()
+        # Interrupt the event loop to wake from asyncio.sleep()
+        if self._loop is not None:
+            with contextlib.suppress(RuntimeError):
+                self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             logger.debug("HeartbeatManager stopped")
@@ -222,7 +227,7 @@ class HeartbeatManager:
         Detects the queue backend and uses the most efficient batching:
         - Redis: Pipeline all SET operations in one round-trip
         - PostgreSQL: Single transaction with all UPDATEs
-        - Other: Sequential job.update() calls (still benefits from dedup)
+        - Other: Sequential job.update() calls (still benefits from deduplication)
 
         Args:
             jobs: List of jobs to update.
@@ -270,11 +275,11 @@ class HeartbeatManager:
             for job in jobs:
                 try:
                     await queue.notify(job)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     # Notification failure shouldn't fail the heartbeat
                     logger.debug("Failed to notify for job %s", job.id)
 
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("Redis pipeline failed, falling back to sequential updates", exc_info=True)
             await self._batch_update_fallback(jobs)
 
@@ -319,7 +324,7 @@ class HeartbeatManager:
                             "scheduled": job.scheduled,
                         },
                     )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.warning("PostgreSQL transaction failed, falling back to sequential updates", exc_info=True)
             await self._batch_update_fallback(jobs)
 
@@ -335,7 +340,7 @@ class HeartbeatManager:
         for job in jobs:
             try:
                 await job.update()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Failed to update job %s",
                     job.id,
