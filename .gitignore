@@ -169,3 +169,6 @@ specs
 AGENTS.md
 CLAUDE.md
 GEMINI.md
+# Flow specification files (local-only)
+.agent/
+.geminiignore

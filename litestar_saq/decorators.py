@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from saq.job import Job
     from saq.types import Context
 
+    from litestar_saq.heartbeat import HeartbeatManager
+
 __all__ = ("monitored_job",)
 
 logger = logging.getLogger(__name__)
@@ -48,13 +50,13 @@ def monitored_job(
 ]:
     """Decorator that adds automatic heartbeat monitoring to SAQ jobs.
 
-    This decorator starts a background task that periodically calls job.update()
-    to send heartbeats, preventing long-running jobs from being marked as stuck
-    by SAQ's heartbeat monitor. The heartbeat task is automatically cleaned up
-    when the job completes, fails, or is cancelled.
+    This decorator provides heartbeat monitoring to prevent long-running jobs
+    from being marked as stuck by SAQ's heartbeat monitor. It signals the
+    HeartbeatManager at the configured interval, which batches and deduplicates
+    updates for efficient single-connection flushes.
 
     Args:
-        interval: Seconds between heartbeat updates. If None (default), the interval
+        interval: Seconds between heartbeat signals. If None (default), the interval
                  is automatically calculated as half of the job's heartbeat timeout,
                  with a minimum of 1 second. If the job has no heartbeat configured,
                  defaults to 5 seconds.
@@ -87,10 +89,10 @@ def monitored_job(
                 return {"model_id": model_id}
 
     Note:
-        - If the job context doesn't contain a job object, monitoring is silently skipped
-        - Heartbeat failures are logged as warnings but don't fail the job
+        - Requires HeartbeatManager in context (auto-injected by Worker)
+        - If no manager present, logs warning and runs without heartbeats
+        - If no job in context, runs without heartbeats
         - Works with regular jobs, cron jobs, and scheduled jobs
-        - Compatible with worker before_process and after_process hooks
         - Auto-calculated interval uses job.heartbeat / 2, floored at 1 second
     """
     if interval is not None and interval <= 0:
@@ -104,24 +106,104 @@ def monitored_job(
         async def wrapper(ctx: "Context", *args: P.args, **kwargs: P.kwargs) -> R:
             job: Optional[Job] = ctx.get("job")  # pyright: ignore[reportUnknownMemberType]
 
+            # If no job, just run the function
+            if job is None:
+                return await func(ctx, *args, **kwargs)
+
+            # Check for HeartbeatManager in context
+            manager: Optional[HeartbeatManager] = ctx.get("heartbeat_manager")  # type: ignore[assignment]  # pyright: ignore[reportUnknownMemberType]
+
+            if manager is None:
+                # No manager - log warning and run without heartbeats
+                logger.warning(
+                    "No HeartbeatManager in context for job %s - running without heartbeat monitoring. "
+                    "Ensure Worker has enable_heartbeat_manager=True (default).",
+                    getattr(job, "id", "unknown"),
+                )
+                return await func(ctx, *args, **kwargs)
+
             # Calculate effective interval
             effective_interval = _calculate_interval(job, interval)
 
-            # Start background heartbeat monitoring
-            heartbeat_task = asyncio.create_task(_heartbeat_loop(job, effective_interval))
-
-            try:
-                # Execute the actual job function
-                return await func(ctx, *args, **kwargs)
-            finally:
-                # Always clean up the heartbeat task
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
+            # Run with manager-based heartbeat signaling
+            return await _run_with_manager(func, ctx, job, manager, effective_interval, *args, **kwargs)
 
         return cast("Callable[Concatenate[Context, P], Awaitable[R]]", wrapper)
 
     return decorator
+
+
+async def _run_with_manager(
+    func: Callable[Concatenate["Context", P], Awaitable[R]],
+    ctx: "Context",
+    job: "Job",
+    manager: "HeartbeatManager",
+    interval: float,
+    *args: P.args,
+    **kwargs: P.kwargs,
+) -> R:
+    """Run job with HeartbeatManager-based heartbeat signaling.
+
+    Args:
+        func: The job function to execute.
+        ctx: SAQ context.
+        job: The SAQ job.
+        manager: HeartbeatManager instance.
+        interval: Seconds between signals.
+        *args: Positional arguments for func.
+        **kwargs: Keyword arguments for func.
+
+    Returns:
+        Result from the job function.
+    """
+    job_id = getattr(job, "id", "unknown")
+
+    # Register with manager
+    manager.register_job(job)
+    logger.debug(
+        "Job %s registered with HeartbeatManager (signal interval: %.1fs)",
+        job_id,
+        interval,
+    )
+
+    # Start signaling loop
+    signal_task = asyncio.create_task(_signal_loop(manager, job_id, interval))
+
+    try:
+        return await func(ctx, *args, **kwargs)
+    finally:
+        # Clean up signal task
+        signal_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await signal_task
+
+        # Unregister from manager
+        manager.unregister_job(job_id)
+        logger.debug("Job %s unregistered from HeartbeatManager", job_id)
+
+
+async def _signal_loop(
+    manager: "HeartbeatManager",
+    job_id: str,
+    interval: float,
+) -> None:
+    """Signal the HeartbeatManager at regular intervals.
+
+    This runs as an asyncio task, periodically calling manager.signal()
+    to indicate the job is still alive. The manager batches and deduplicates
+    these signals.
+
+    Args:
+        manager: HeartbeatManager to signal.
+        job_id: ID of the job to signal for.
+        interval: Seconds between signals.
+    """
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            manager.signal(job_id)
+    except asyncio.CancelledError:
+        pass  # Expected on job completion
 
 
 def _calculate_interval(job: "Optional[Job]", explicit_interval: Optional[float]) -> float:
@@ -148,72 +230,3 @@ def _calculate_interval(job: "Optional[Job]", explicit_interval: Optional[float]
 
     # Fallback to default
     return DEFAULT_HEARTBEAT_INTERVAL
-
-
-async def _heartbeat_loop(job: "Optional[Job]", interval: float) -> None:
-    """Run periodic heartbeat updates for a job.
-
-    This is an internal function that runs in a background task, sending
-    heartbeats at the specified interval until cancelled.
-
-    Args:
-        job: The SAQ job to monitor. If None, returns immediately.
-        interval: Seconds between heartbeat updates.
-
-    Note:
-        - Catches and logs exceptions from job.update()
-        - Continues on failure (doesn't stop monitoring)
-        - Cancellation is expected and not logged as error
-    """
-    if job is None:
-        logger.debug("No job in context, heartbeat monitoring disabled")
-        return
-
-    job_id = getattr(job, "id", "unknown")
-    logger.info(
-        "Heartbeat monitoring started for job %s (interval: %.1fs)",
-        job_id,
-        interval,
-        extra={
-            "job_id": job_id,
-            "event": "heartbeat_started",
-            "interval": interval,
-        },
-    )
-
-    try:
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                await job.update()
-                logger.debug(
-                    "Heartbeat sent for job %s",
-                    job_id,
-                    extra={
-                        "job_id": job_id,
-                        "event": "heartbeat_sent",
-                    },
-                )
-            except Exception as e:  # noqa: BLE001
-                # Log but continue - heartbeat failures shouldn't kill jobs
-                logger.warning(
-                    "Failed to send heartbeat for job %s: %s",
-                    job_id,
-                    e,
-                    exc_info=True,
-                    extra={
-                        "job_id": job_id,
-                        "event": "heartbeat_failed",
-                        "error": str(e),
-                    },
-                )
-    except asyncio.CancelledError:
-        # Expected when job completes - don't re-raise
-        logger.debug(
-            "Heartbeat monitoring stopped for job %s",
-            job_id,
-            extra={
-                "job_id": job_id,
-                "event": "heartbeat_stopped",
-            },
-        )

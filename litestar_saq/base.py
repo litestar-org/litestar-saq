@@ -12,6 +12,7 @@ from saq.job import CronJob as SaqCronJob
 from saq.types import Context
 from saq.worker import Worker as SaqWorker
 
+from litestar_saq.heartbeat import HeartbeatManager
 from litestar_saq.typing import OPENTELEMETRY_INSTALLED, Span, Tracer
 
 if TYPE_CHECKING:
@@ -96,6 +97,11 @@ class Worker(SaqWorker[Context]):
         enable_otel: Enable OpenTelemetry instrumentation for job processing.
         otel_tracer: Optional custom tracer instance. If not provided and enable_otel
             is True, a default tracer will be created.
+        enable_heartbeat_manager: Enable centralized HeartbeatManager for batched
+            heartbeat updates (default: True). The manager is injected into job context
+            and used by the @monitored_job decorator for efficient batched updates.
+        heartbeat_flush_interval: Seconds between heartbeat batch flushes when
+            HeartbeatManager is enabled. Default: 30.0.
     """
 
     def __init__(
@@ -123,14 +129,20 @@ class Worker(SaqWorker[Context]):
         poll_interval: "Optional[float]" = None,
         enable_otel: bool = False,
         otel_tracer: "Optional[Tracer]" = None,
+        enable_heartbeat_manager: bool = True,
+        heartbeat_flush_interval: float = 30.0,
     ) -> None:
         self.separate_process = separate_process
         self.multiprocessing_mode = multiprocessing_mode
         self._enable_otel = enable_otel and OPENTELEMETRY_INSTALLED
         self._otel_tracer = otel_tracer
+        self._enable_heartbeat_manager = enable_heartbeat_manager
+        self._heartbeat_manager: Optional[HeartbeatManager] = None
+        self._heartbeat_flush_interval = heartbeat_flush_interval
 
         otel_before: list[Any] = [self._otel_before_process] if self._enable_otel else []
         otel_after: list[Any] = [self._otel_after_process] if self._enable_otel else []
+        heartbeat_before: list[Any] = [self._inject_heartbeat_manager] if enable_heartbeat_manager else []
         user_before = _normalize_hooks(before_process)
         user_after = _normalize_hooks(after_process)
 
@@ -141,7 +153,7 @@ class Worker(SaqWorker[Context]):
             "cron_tz": cron_tz,
             "startup": startup,
             "shutdown": shutdown,
-            "before_process": otel_before + user_before,
+            "before_process": otel_before + heartbeat_before + user_before,
             "after_process": user_after + otel_after,
             "timers": timers,
             "dequeue_timeout": dequeue_timeout,
@@ -186,6 +198,11 @@ class Worker(SaqWorker[Context]):
         span: Optional[Span] = ctx.get(_OTEL_SPAN_KEY)  # type: ignore[arg-type]
         error: Optional[BaseException] = ctx.get("exception")
         end_process_span(ctx, span, error)
+
+    async def _inject_heartbeat_manager(self, ctx: Context) -> None:
+        """Inject HeartbeatManager into job context for monitored_job decorator."""
+        if self._heartbeat_manager is not None:
+            ctx["heartbeat_manager"] = self._heartbeat_manager  # type: ignore[literal-required,typeddict-unknown-key]
 
     def get_structlog_context(self) -> dict[str, Any]:
         """Build context dictionary for structlog binding.
@@ -244,13 +261,26 @@ class Worker(SaqWorker[Context]):
         # Configure structlog context before starting
         self.configure_structlog_context()
 
+        # Start heartbeat manager if enabled
+        if self._enable_heartbeat_manager:
+            self._heartbeat_manager = HeartbeatManager(
+                queue=self.queue,
+                flush_interval=self._heartbeat_flush_interval,
+            )
+            self._heartbeat_manager.start()
+
         if not self.separate_process:
             self.SIGNALS = []
             loop = asyncio.get_running_loop()
             self._saq_asyncio_tasks = loop.create_task(self.start())
 
     async def on_app_shutdown(self) -> None:
-        """Attach the worker to the running event loop."""
+        """Stop the worker and cleanup resources."""
+        # Stop heartbeat manager if running
+        if self._heartbeat_manager is not None:
+            self._heartbeat_manager.stop()
+            self._heartbeat_manager = None
+
         if not self.separate_process:
             loop = asyncio.get_running_loop()
             self._saq_asyncio_tasks = loop.create_task(self.stop())
