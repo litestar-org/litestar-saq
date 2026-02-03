@@ -82,7 +82,7 @@ class SAQPlugin(InitPluginProtocol, CLIPlugin):
                 ),
             )
             app_config.route_handlers.append(
-                build_controller(self._config.web_path, self._config.web_guards, self._config.web_include_in_schema),  # type: ignore[arg-type]
+                build_controller(self._config.web_path, self._config.web_guards, self._config.web_include_in_schema),
             )
         app_config.signature_namespace.update(self._config.signature_namespace)
 
