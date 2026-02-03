@@ -147,3 +147,42 @@ def test_queue_detail_returns_404_when_missing() -> None:
     with TestClient(app) as client:
         resp = client.get("/saq/api/queues/missing")
         assert resp.status_code == 404
+
+
+def test_build_controller_with_empty_guards_list() -> None:
+    """Test that build_controller works with an empty guards list (issue #83)."""
+    # This should not raise TypeError: unhashable type: 'list'
+    controller = build_controller("/saq", controller_guards=[])
+
+    queues = TaskQueues(queues={"default": DummyQueue("default")})
+    app = Litestar(
+        route_handlers=[controller],
+        dependencies={"task_queues": Provide(lambda: queues, sync_to_thread=False)},
+        signature_namespace={"TaskQueues": TaskQueues, "QueueInfo": QueueInfo},
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/saq")
+        assert resp.status_code == 200
+
+
+def test_build_controller_with_guards() -> None:
+    """Test that build_controller works with actual guards."""
+    from litestar.connection import ASGIConnection
+    from litestar.handlers import BaseRouteHandler
+
+    def sample_guard(connection: ASGIConnection, route_handler: BaseRouteHandler) -> None:
+        pass  # Allow all requests
+
+    controller = build_controller("/saq", controller_guards=[sample_guard])
+
+    queues = TaskQueues(queues={"default": DummyQueue("default")})
+    app = Litestar(
+        route_handlers=[controller],
+        dependencies={"task_queues": Provide(lambda: queues, sync_to_thread=False)},
+        signature_namespace={"TaskQueues": TaskQueues, "QueueInfo": QueueInfo},
+    )
+
+    with TestClient(app) as client:
+        resp = client.get("/saq")
+        assert resp.status_code == 200

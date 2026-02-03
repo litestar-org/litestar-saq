@@ -36,14 +36,46 @@ def get_queue_or_404(task_queues: "TaskQueues", queue_id: str) -> "Queue":
     return queue
 
 
-@lru_cache(typed=True)
 def build_controller(
     url_base: str = "/saq",
     controller_guards: "Optional[list[Guard]]" = None,  # pyright: ignore[reportUnknownParameterType]
     include_in_schema_: bool = False,
 ) -> "type[Controller]":
+    """Build SAQ controller with web UI endpoints.
+
+    Args:
+        url_base: Base URL path for the controller.
+        controller_guards: Optional list of guards to apply to the controller.
+        include_in_schema_: Whether to include routes in the OpenAPI schema.
+
+    Returns:
+        A configured SAQController class.
+    """
+    guards_tuple = tuple(controller_guards) if controller_guards else None  # pyright: ignore[reportUnknownArgumentType,reportUnknownVariableType]
+    return _build_controller_cached(url_base, guards_tuple, include_in_schema_)  # pyright: ignore[reportUnknownArgumentType]
+
+
+@lru_cache(typed=True)
+def _build_controller_cached(
+    url_base: str,
+    controller_guards: "Optional[tuple[Guard, ...]]",  # pyright: ignore[reportUnknownParameterType]
+    include_in_schema_: bool,
+) -> "type[Controller]":
+    """Internal cached controller builder.
+
+    Args:
+        url_base: Base URL path for the controller.
+        controller_guards: Optional tuple of guards (hashable for caching).
+        include_in_schema_: Whether to include routes in the OpenAPI schema.
+
+    Returns:
+        A configured SAQController class.
+    """
     from litestar import Controller, MediaType, Response, get, post
     from litestar.status_codes import HTTP_202_ACCEPTED, HTTP_500_INTERNAL_SERVER_ERROR
+
+    # Convert tuple back to list for the controller (Litestar expects list or None)
+    guards_list = list(controller_guards) if controller_guards else None  # pyright: ignore[reportUnknownArgumentType,reportUnknownVariableType]
 
     normalized_root = url_base.rstrip("/") or "/saq"
     escaped_root = html.escape(normalized_root)
@@ -67,7 +99,7 @@ def build_controller(
 
     class SAQController(Controller):
         tags = ["SAQ"]
-        guards = controller_guards  # pyright: ignore[reportUnknownVariableType]
+        guards = guards_list  # pyright: ignore[reportUnknownVariableType]
         include_in_schema = include_in_schema_
 
         @get(
