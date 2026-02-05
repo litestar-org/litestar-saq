@@ -85,6 +85,12 @@ class SAQConfig:
 
     Default is set to 1.
     """
+    app_path: "Optional[str]" = None
+    """Litestar app path to use when spawning worker processes.
+
+    This is required on platforms that must use the "spawn" start method
+    (e.g. macOS) unless the `LITESTAR_APP` environment variable is set.
+    """
 
     json_deserializer: LoadType = decode_json
     """This is a Python callable that will

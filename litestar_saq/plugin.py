@@ -1,9 +1,9 @@
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
+import os
 import signal
 import sys
 import time
 from contextlib import contextmanager
-from multiprocessing import Process
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from litestar.plugins import CLIPlugin, InitPluginProtocol
@@ -176,10 +176,10 @@ class SAQPlugin(InitPluginProtocol, CLIPlugin):
 
         from litestar.cli._utils import console  # pyright: ignore
 
-        from litestar_saq.cli import run_saq_worker
+        from litestar_saq.cli import run_saq_worker, run_saq_worker_from_app_path
 
         if platform.system() == "Darwin":
-            multiprocessing.set_start_method("fork", force=True)
+            multiprocessing.set_start_method("spawn", force=True)
 
         if not self._config.use_server_lifespan:
             yield
@@ -202,17 +202,37 @@ class SAQPlugin(InitPluginProtocol, CLIPlugin):
         signal.signal(signal.SIGINT, handle_shutdown)
 
         try:
+            if platform.system() == "Darwin":
+                ctx = multiprocessing.get_context("spawn")
+            else:
+                ctx = multiprocessing.get_context()
+            use_spawn = ctx.get_start_method() == "spawn"
+            app_path = self._config.app_path or os.environ.get("LITESTAR_APP") if use_spawn else None
+            if use_spawn and not app_path:
+                msg = (
+                    "SAQ worker spawn requires app_path in SAQConfig or LITESTAR_APP "
+                    "to be set (e.g. 'module:app' or 'module:create_app')."
+                )
+                raise RuntimeError(msg)
+
             for worker_name, worker in self.get_workers().items():
                 for i in range(self.config.worker_processes):
                     console.print(f"[yellow]Starting worker process {i + 1} for {worker_name}[/]")
-                    process = Process(
-                        target=run_saq_worker,
-                        args=(
-                            worker,
-                            app.logging_config,
-                        ),
-                        name=f"worker-{worker_name}-{i + 1}",
-                    )
+                    if use_spawn:
+                        process = ctx.Process(
+                            target=run_saq_worker_from_app_path,
+                            args=(cast(str, app_path), worker_name),
+                            name=f"worker-{worker_name}-{i + 1}",
+                        )
+                    else:
+                        process = ctx.Process(
+                            target=run_saq_worker,
+                            args=(
+                                worker,
+                                app.logging_config,
+                            ),
+                            name=f"worker-{worker_name}-{i + 1}",
+                        )
                     process.start()
                     self._processes.append(process)
 

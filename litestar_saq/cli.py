@@ -1,8 +1,9 @@
 import contextlib
+import os
 import signal
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
 if TYPE_CHECKING:
     import asyncio
@@ -223,7 +224,7 @@ def build_cli_app() -> "Group":  # noqa: C901, PLR0915
         """Run the API server."""
         console.rule("[yellow]Starting SAQ Workers[/]", align="left")
         if platform.system() == "Darwin":
-            multiprocessing.set_start_method("fork", force=True)
+            multiprocessing.set_start_method("spawn", force=True)
 
         if app.logging_config is not None:
             app.logging_config.configure()
@@ -252,22 +253,47 @@ def build_cli_app() -> "Group":  # noqa: C901, PLR0915
         signal.signal(signal.SIGTERM, handle_shutdown_signal)
         signal.signal(signal.SIGINT, handle_shutdown_signal)
 
+        if platform.system() == "Darwin":
+            ctx = multiprocessing.get_context("spawn")
+        else:
+            ctx = multiprocessing.get_context()
+        use_spawn = ctx.get_start_method() == "spawn"
+        app_path = plugin.config.app_path or os.environ.get("LITESTAR_APP") if use_spawn else None
+        if use_spawn and not app_path:
+            msg = (
+                "SAQ worker spawn requires app_path in SAQConfig or LITESTAR_APP "
+                "to be set (e.g. 'module:app' or 'module:create_app')."
+            )
+            raise RuntimeError(msg)
+
         if workers > 1:
             for _ in range(workers - 1):
                 for worker in managed_workers:
-                    p = multiprocessing.Process(
-                        target=run_saq_worker,
-                        args=(
-                            worker,
-                            app.logging_config,
-                        ),
-                    )
+                    if use_spawn:
+                        p = ctx.Process(
+                            target=run_saq_worker_from_app_path,
+                            args=(cast(str, app_path), worker.queue.name),
+                        )
+                    else:
+                        p = ctx.Process(
+                            target=run_saq_worker,
+                            args=(
+                                worker,
+                                app.logging_config,
+                            ),
+                        )
                     p.start()
                     processes.append(p)
 
         if len(managed_workers) > 1:
             for j in range(len(managed_workers) - 1):
-                p = multiprocessing.Process(target=run_saq_worker, args=(managed_workers[j + 1], app.logging_config))
+                if use_spawn:
+                    p = ctx.Process(
+                        target=run_saq_worker_from_app_path,
+                        args=(cast(str, app_path), managed_workers[j + 1].queue.name),
+                    )
+                else:
+                    p = ctx.Process(target=run_saq_worker, args=(managed_workers[j + 1], app.logging_config))
                 p.start()
                 processes.append(p)
 
@@ -350,6 +376,17 @@ def show_saq_info(app: "Litestar", workers: int, plugin: "SAQPlugin") -> None:  
     table.add_row("Queues", str(len(plugin.config.queue_configs)))
 
     console.print(table)
+
+
+def run_saq_worker_from_app_path(app_path: str, worker_name: str) -> None:
+    """Run a worker in a spawned process by reloading the Litestar app."""
+    from litestar.cli._utils import _load_app_from_path
+
+    loaded_app = _load_app_from_path(app_path)
+    app = loaded_app.app
+    plugin = get_saq_plugin(app)
+    worker = plugin.get_workers()[worker_name]
+    run_saq_worker(worker, app.logging_config)
 
 
 def run_saq_worker(worker: "Worker", logging_config: "Optional[BaseLoggingConfig]") -> None:
