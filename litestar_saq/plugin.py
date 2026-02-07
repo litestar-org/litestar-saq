@@ -1,9 +1,9 @@
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
+import os
 import signal
 import sys
 import time
 from contextlib import contextmanager
-from multiprocessing import Process
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from litestar.plugins import CLIPlugin, InitPluginProtocol
@@ -169,6 +169,27 @@ class SAQPlugin(InitPluginProtocol, CLIPlugin):
     def get_queue(self, name: str) -> "Queue":
         return self.get_queues().get(name)
 
+    @staticmethod
+    def _resolve_multiprocessing_context(multiprocessing_module: Any, platform_name: str) -> Any:
+        """Resolve multiprocessing context for worker startup.
+
+        Python 3.14 defaults to ``forkserver`` on Linux, which requires picklable
+        process args. SAQ worker instances carry non-picklable state, so prefer
+        ``fork`` on non-Darwin systems when available.
+        """
+        if platform_name == "Darwin":
+            multiprocessing_module.set_start_method("spawn", force=True)
+            return multiprocessing_module.get_context("spawn")
+
+        default_ctx = multiprocessing_module.get_context()
+        if default_ctx.get_start_method() != "forkserver":
+            return default_ctx
+
+        try:
+            return multiprocessing_module.get_context("fork")
+        except ValueError:
+            return default_ctx
+
     @contextmanager
     def server_lifespan(self, app: "Litestar") -> "Iterator[None]":
         import multiprocessing
@@ -176,17 +197,14 @@ class SAQPlugin(InitPluginProtocol, CLIPlugin):
 
         from litestar.cli._utils import console  # pyright: ignore
 
-        from litestar_saq.cli import run_saq_worker
-
-        if platform.system() == "Darwin":
-            multiprocessing.set_start_method("fork", force=True)
+        from litestar_saq.cli import run_saq_worker, run_saq_worker_from_app_path
 
         if not self._config.use_server_lifespan:
             yield
             return
 
         console.rule("[yellow]Starting SAQ Workers[/]", align="left")
-        self._processes: list[Process] = []
+        self._processes: list[Any] = []
         self._shutdown_timeout = self._get_shutdown_timeout()
 
         def handle_shutdown(_signum: Any, _frame: Any) -> None:
@@ -202,17 +220,36 @@ class SAQPlugin(InitPluginProtocol, CLIPlugin):
         signal.signal(signal.SIGINT, handle_shutdown)
 
         try:
+            ctx = self._resolve_multiprocessing_context(multiprocessing, platform.system())
+            start_method = ctx.get_start_method()
+            requires_reload_by_app_path = start_method in {"spawn", "forkserver"}
+            app_path = self._config.app_path or os.environ.get("LITESTAR_APP") if requires_reload_by_app_path else None
+            if requires_reload_by_app_path and not app_path:
+                msg = (
+                    "SAQ worker start method requiring picklable process args "
+                    f"({start_method}) requires app_path in SAQConfig or LITESTAR_APP "
+                    "to be set (e.g. 'module:app' or 'module:create_app')."
+                )
+                raise RuntimeError(msg)  # noqa: TRY301
+
             for worker_name, worker in self.get_workers().items():
                 for i in range(self.config.worker_processes):
                     console.print(f"[yellow]Starting worker process {i + 1} for {worker_name}[/]")
-                    process = Process(
-                        target=run_saq_worker,
-                        args=(
-                            worker,
-                            app.logging_config,
-                        ),
-                        name=f"worker-{worker_name}-{i + 1}",
-                    )
+                    if requires_reload_by_app_path:
+                        process = ctx.Process(
+                            target=run_saq_worker_from_app_path,
+                            args=(cast("str", app_path), worker_name),
+                            name=f"worker-{worker_name}-{i + 1}",
+                        )
+                    else:
+                        process = ctx.Process(
+                            target=run_saq_worker,
+                            args=(
+                                worker,
+                                app.logging_config,
+                            ),
+                            name=f"worker-{worker_name}-{i + 1}",
+                        )
                     process.start()
                     self._processes.append(process)
 
@@ -227,7 +264,7 @@ class SAQPlugin(InitPluginProtocol, CLIPlugin):
             console.print("[yellow]SAQ workers stopped.[/]")
 
     @staticmethod
-    def _terminate_workers(processes: "list[Process]", timeout: float = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
+    def _terminate_workers(processes: "list[Any]", timeout: float = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         """Gracefully terminate worker processes with timeout.
 
         Args:
