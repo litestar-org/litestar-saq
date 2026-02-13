@@ -7,7 +7,7 @@ from click.testing import CliRunner
 from litestar.cli._utils import LitestarGroup
 from redis.asyncio import Redis
 
-from litestar_saq.cli import _terminate_worker_processes
+from litestar_saq.cli import _terminate_worker_processes, get_max_shutdown_timeout
 from tests.test_cli.conftest import CreateAppFileFixture
 
 if TYPE_CHECKING:
@@ -230,3 +230,38 @@ def test_signal_handlers_registered_in_run_saq_worker() -> None:
             asyncio.set_event_loop(None)
         else:
             asyncio.set_event_loop(original_loop)
+
+
+def test_get_max_shutdown_timeout_handles_none_grace_period() -> None:
+    """Test that get_max_shutdown_timeout handles None values for _shutdown_grace_period_s."""
+    mock_worker = Mock()
+    mock_worker._shutdown_grace_period_s = None
+    mock_worker._cancellation_hard_deadline_s = 10
+
+    timeout = get_max_shutdown_timeout([mock_worker])
+
+    assert timeout == 12.0
+
+
+def test_get_max_shutdown_timeout_with_valid_values() -> None:
+    """Test that get_max_shutdown_timeout calculates correctly with valid values."""
+    mock_worker1 = Mock()
+    mock_worker1._shutdown_grace_period_s = 3.0
+    mock_worker1._cancellation_hard_deadline_s = 5.0
+
+    mock_worker2 = Mock()
+    mock_worker2._shutdown_grace_period_s = 2.0
+    mock_worker2._cancellation_hard_deadline_s = 3.0
+
+    timeout = get_max_shutdown_timeout([mock_worker1, mock_worker2])
+
+    assert timeout == 10.0
+
+
+def test_get_max_shutdown_timeout_falls_back_to_default() -> None:
+    """Test that get_max_shutdown_timeout falls back to default when no grace periods configured."""
+    mock_worker = Mock(spec=[])
+
+    timeout = get_max_shutdown_timeout([mock_worker])
+
+    assert timeout == 5.0
