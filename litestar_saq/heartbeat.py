@@ -126,10 +126,12 @@ class HeartbeatManager:
         to terminate. After stopping, pending heartbeats are lost.
         """
         self._stop_event.set()
-        # Interrupt the event loop to wake from asyncio.sleep()
-        if self._loop is not None and self._wake_event is not None:
+        # Retain references while the manager thread may clear its state.
+        loop = self._loop
+        wake_event = self._wake_event
+        if loop is not None and wake_event is not None:
             with contextlib.suppress(RuntimeError):
-                self._loop.call_soon_threadsafe(self._wake_event.set)
+                loop.call_soon_threadsafe(wake_event.set)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             logger.debug("HeartbeatManager stopped")
@@ -189,17 +191,15 @@ class HeartbeatManager:
 
     async def _manager_loop(self) -> None:
         """Main loop - flush pending heartbeats every interval."""
-        if self._wake_event is None:
-            return
+        wake_event = self._wake_event
+        if wake_event is None:
+            msg = "HeartbeatManager wake event is not initialized"
+            raise RuntimeError(msg)
 
         while not self._stop_event.is_set():
             # Wait for either the next flush interval or a shutdown wakeup.
-            try:
-                await asyncio.wait_for(self._wake_event.wait(), timeout=self._flush_interval)
-            except asyncio.TimeoutError:
-                pass
-            else:
-                self._wake_event.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wake_event.wait(), timeout=self._flush_interval)
 
             if not self._stop_event.is_set():
                 await self._flush()
