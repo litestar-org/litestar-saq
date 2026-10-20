@@ -94,6 +94,7 @@ class HeartbeatManager:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._wake_event: Optional[asyncio.Event] = None
         self._jobs: dict[str, Job] = {}  # job_id -> Job reference
         self._jobs_lock = threading.Lock()
 
@@ -125,10 +126,12 @@ class HeartbeatManager:
         to terminate. After stopping, pending heartbeats are lost.
         """
         self._stop_event.set()
-        # Interrupt the event loop to wake from asyncio.sleep()
-        if self._loop is not None:
+        # Retain references while the manager thread may clear its state.
+        loop = self._loop
+        wake_event = self._wake_event
+        if loop is not None and wake_event is not None:
             with contextlib.suppress(RuntimeError):
-                self._loop.call_soon_threadsafe(self._loop.stop)
+                loop.call_soon_threadsafe(wake_event.set)
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             logger.debug("HeartbeatManager stopped")
@@ -177,17 +180,27 @@ class HeartbeatManager:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
         try:
+            self._wake_event = asyncio.Event()
             self._loop.run_until_complete(self._manager_loop())
         except Exception:
             logger.exception("HeartbeatManager thread crashed")
         finally:
             self._loop.close()
+            self._loop = None
+            self._wake_event = None
 
     async def _manager_loop(self) -> None:
         """Main loop - flush pending heartbeats every interval."""
+        wake_event = self._wake_event
+        if wake_event is None:
+            msg = "HeartbeatManager wake event is not initialized"
+            raise RuntimeError(msg)
+
         while not self._stop_event.is_set():
-            # Use wait with timeout for responsive shutdown
-            await asyncio.sleep(self._flush_interval)
+            # Wait for either the next flush interval or a shutdown wakeup.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wake_event.wait(), timeout=self._flush_interval)
+
             if not self._stop_event.is_set():
                 await self._flush()
 

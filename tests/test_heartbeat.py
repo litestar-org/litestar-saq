@@ -1,15 +1,34 @@
 """Tests for HeartbeatManager."""
 
 import asyncio
+import contextlib
+import logging
 import threading
 import time
+from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from litestar_saq import heartbeat
 from litestar_saq.heartbeat import HeartbeatManager
 
 pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def manager_waiting(monkeypatch: pytest.MonkeyPatch) -> threading.Event:
+    """Signal when the manager enters its asynchronous event wait."""
+    waiting = threading.Event()
+
+    class WaitingEvent(asyncio.Event):
+        async def wait(self) -> bool:
+            waiting.set()
+            return await super().wait()
+
+    monkeypatch.setattr(heartbeat.asyncio, "Event", WaitingEvent)
+    return waiting
 
 
 # =============================================================================
@@ -162,12 +181,114 @@ def test_stop_terminates_thread() -> None:
     manager = HeartbeatManager(queue=queue_mock, flush_interval=0.1)
 
     manager.start()
-    assert manager._thread is not None
-    assert manager._thread.is_alive()
+    try:
+        assert manager._thread is not None
+        assert manager._thread.is_alive()
+        manager.stop()
+        assert manager._thread is not None
+        assert not manager._thread.is_alive()
+    finally:
+        manager.stop()
+
+
+def test_stop_does_not_log_thread_crashed(caplog: pytest.LogCaptureFixture, manager_waiting: threading.Event) -> None:
+    """Test normal shutdown does not log the manager thread as crashed."""
+    queue_mock = Mock()
+    manager = HeartbeatManager(queue=queue_mock, flush_interval=30.0)
+    caplog.set_level(logging.ERROR, logger="litestar_saq.heartbeat")
+
+    manager.start()
+    try:
+        assert manager_waiting.wait(timeout=5.0)
+        manager.stop()
+        assert manager._thread is not None
+        assert not manager._thread.is_alive()
+    finally:
+        manager.stop()
+
+    assert "HeartbeatManager thread crashed" not in caplog.text
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+def test_stop_wakes_sleeping_manager_without_waiting_flush_interval(
+    manager_waiting: threading.Event, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Test stop() wakes the manager even when the flush interval is long."""
+    queue_mock = Mock()
+    manager = HeartbeatManager(queue=queue_mock, flush_interval=30.0)
+
+    manager.start()
+    try:
+        assert manager_waiting.wait(timeout=5.0)
+        started = time.monotonic()
+        manager.stop()
+        assert time.monotonic() - started < 1.0
+        assert manager._thread is not None
+        assert not manager._thread.is_alive()
+    finally:
+        manager.stop()
+
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize("fields", [("_loop",), ("_wake_event",), ("_loop", "_wake_event")])
+def test_stop_uses_local_references_during_cleanup(monkeypatch: pytest.MonkeyPatch, fields: tuple[str, ...]) -> None:
+    """Retain the loop and event when cleanup happens after the non-None check."""
+    manager = HeartbeatManager(queue=Mock())
+    loop = Mock(spec=asyncio.AbstractEventLoop)
+    wake_event = asyncio.Event()
+    manager._loop = loop
+    manager._wake_event = wake_event
+
+    @contextlib.contextmanager
+    def cleanup_before_call(*exceptions: type[BaseException]) -> Iterator[None]:
+        # Inject cleanup at the boundary between the guard and scheduling.
+        for field in fields:
+            setattr(manager, field, None)
+        with contextlib.suppress(*exceptions):
+            yield
+
+    monkeypatch.setattr(heartbeat, "contextlib", SimpleNamespace(suppress=cleanup_before_call))
 
     manager.stop()
 
-    assert not manager._thread.is_alive() if manager._thread else True
+    loop.call_soon_threadsafe.assert_called_once_with(wake_event.set)
+    callback = loop.call_soon_threadsafe.call_args.args[0]
+    callback()
+    assert wake_event.is_set()
+
+
+def test_stop_with_closed_loop() -> None:
+    """Tolerate a loop that closed before the shutdown callback was scheduled."""
+    manager = HeartbeatManager(queue=Mock())
+    loop = asyncio.new_event_loop()
+    loop.close()
+    manager._loop = loop
+    manager._wake_event = asyncio.Event()
+
+    manager.stop()
+
+    assert manager._stop_event.is_set()
+
+
+def test_stop_after_thread_exited(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """Allow repeated stop calls after the thread has completed its cleanup."""
+    manager = HeartbeatManager(queue=Mock())
+    monkeypatch.setattr(manager, "_manager_loop", AsyncMock())
+
+    manager.start()
+    try:
+        assert manager._thread is not None
+        manager._thread.join(timeout=5.0)
+        assert not manager._thread.is_alive()
+        assert manager._loop is None
+        assert manager._wake_event is None
+        manager.stop()
+        manager.stop()
+    finally:
+        manager.stop()
+
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
 
 
 def test_stop_without_start() -> None:
@@ -177,6 +298,14 @@ def test_stop_without_start() -> None:
 
     # Should not raise
     manager.stop()
+
+
+async def test_manager_loop_requires_wake_event() -> None:
+    """Report an initialization error rather than silently stopping heartbeats."""
+    manager = HeartbeatManager(queue=Mock())
+
+    with pytest.raises(RuntimeError, match="wake event is not initialized"):
+        await manager._manager_loop()
 
 
 # =============================================================================
